@@ -1,0 +1,592 @@
+"""LocalSummary / PhaseSummary / RootCauseAnnotation 的结构校验 + 越界检查 + 软修正。
+
+校验失败时返回 (ok=False, errors=[...]) 给上层决定是否重生成。
+"""
+from __future__ import annotations
+
+import re
+from typing import Dict, Any, List, Optional, Set, Tuple
+
+from .. import config
+from ..core.schema import LocalSummary, PhaseSummary, RootCauseAnnotation, Step
+
+
+# planner 形态归因(裸 planner 或委派态)**不得**配"执行/验证/非agent"类主因——
+# 那是执行者/验证者/环境的责任(防过度归因)。允许理解(A)/认知(B)/规划(C)类,因为 planner 确实做这些。
+_PLANNER_PRIMARY_FORBIDDEN = frozenset({
+    "D1_wrong_tool_or_args", "D2_unrecovered_tool_failure", "D3_stuck_or_repetition",
+    "E1_verification_gap", "E2_premature_or_wrong_completion",
+    "X1_underspecified_input", "X2_unrecoverable_environment",
+})
+# 忠实实现「有缺陷的计划」时,缺陷的两种主形态:计划逻辑本身错(C1),或计划无视了任务明示的方法/约束(A2)。
+_FAITHFUL_PRIMARY_OK = frozenset({"C1_flawed_plan", "A2_ignored_constraint"})
+
+_WS = re.compile(r"\s+")
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
+_MANIFEST_CHAIN_ROLES = frozenset({"manifestation", "exposure", "terminal"})
+_RE_RECOVERED_ERROR = re.compile(r"(error|failed|failure|traceback|exception|unable|could not|decode)", re.I)
+_RE_RECOVERY_LATER = re.compile(
+    r"(success|successfully|download complete|extracted|unzip|loaded|opened|retrieved|"
+    r"computed|calculated|now have|able to|fixed|resolved)",
+    re.I,
+)
+
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+def _is_int_in(v: Any, allowed: Set[int]) -> bool:
+    try:
+        return int(v) in allowed
+    except (TypeError, ValueError):
+        return False
+
+
+def _to_int(v: Any) -> Optional[int]:
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm_text(t: str) -> str:
+    return _WS.sub(" ", (t or "")).strip().lower()
+
+
+def _quote_grounded(quote: str, delegate_text: str) -> bool:
+    """`quote` 是否确为 `delegate_text` 的(归一化)子串,或其词集 ≥80% 落在原文内。
+
+    用于把模型"忠实实现"的声明变成可机器校验的事实:回溯到 planner 必须能在该委派步原文里
+    找到被照搬的缺陷句。归一化折叠空白+小写,容忍排版差异;过短的 quote(<15 字符)不足以为证。
+    """
+    q, d = _norm_text(quote), _norm_text(delegate_text)
+    if len(q) < 15:
+        return False
+    if q in d:
+        return True
+    qw = {w.lower() for w in _WORD.findall(quote or "")}
+    if len(qw) >= 4:
+        dw = {w.lower() for w in _WORD.findall(delegate_text or "")}
+        return len(qw & dw) / len(qw) >= 0.8
+    return False
+
+
+def _step_field_ok(
+    step_val: Any,
+    allowed_int: Set[int],
+    *,
+    allow_pseudo: bool = False,
+) -> bool:
+    """Check a recorded step id, optionally allowing explanatory pseudo-steps."""
+    if isinstance(step_val, int):
+        return step_val in allowed_int
+    s = str(step_val or "").strip()
+    if not s:
+        return False
+    if allow_pseudo and s in config.ALLOWED_PSEUDO_STEPS:
+        return True
+    try:
+        return int(s) in allowed_int
+    except ValueError:
+        return False
+
+
+def _event_dict(da: Dict[str, Any], key: str) -> Dict[str, Any]:
+    ev = da.get(key)
+    return ev if isinstance(ev, dict) else {}
+
+
+def _validate_event(
+    event: Dict[str, Any],
+    key: str,
+    global_step_ids: Set[int],
+    valid_agents_raw: Set[str],
+) -> List[str]:
+    errs: List[str] = []
+    if not event:
+        return [f"detailed_analysis.{key} missing or not dict"]
+    if event.get("agent") not in valid_agents_raw:
+        errs.append(
+            f"{key}.agent={event.get('agent')!r} not in trajectory recorded roles"
+        )
+    if not _step_field_ok(event.get("step"), global_step_ids):
+        errs.append(f"{key}.step={event.get('step')!r} invalid")
+    cat = event.get("primary_category")
+    if cat and cat not in config.CATEGORY_CODES:
+        errs.append(f"{key}.primary_category={cat!r} not in enum")
+    for i, sid in enumerate(event.get("evidence_step_ids") or []):
+        if not _is_int_in(sid, global_step_ids):
+            errs.append(f"{key}.evidence_step_ids[{i}]={sid!r} not in global step_ids")
+    return errs
+
+
+def _looks_like_recovered_tool_noise(step: Step, all_steps: List[Step]) -> bool:
+    if not _RE_RECOVERED_ERROR.search(step.content_full or ""):
+        return False
+    later = [s for s in all_steps if s.step_id > step.step_id]
+    return any(_RE_RECOVERY_LATER.search(s.content_full or "") for s in later[:20])
+
+
+# ----------------------------------------------------------------------------
+# LocalSummary
+# ----------------------------------------------------------------------------
+def validate_local_summary(ls: LocalSummary, segment_step_ids: Set[int]) -> Tuple[bool, List[str]]:
+    errs: List[str] = []
+
+    if not isinstance(ls.segment_id, int):
+        errs.append(f"segment_id not int: {ls.segment_id!r}")
+
+    if not (isinstance(ls.step_range, list) and len(ls.step_range) == 2):
+        errs.append(f"step_range malformed: {ls.step_range!r}")
+
+    for i, ev in enumerate(ls.key_events or []):
+        if not isinstance(ev, dict):
+            errs.append(f"key_events[{i}] not dict")
+            continue
+        for j, sid in enumerate(ev.get("step_ids") or []):
+            if not _is_int_in(sid, segment_step_ids):
+                errs.append(f"key_events[{i}].step_ids[{j}]={sid!r} out of segment")
+
+    for i, cf in enumerate(ls.candidate_failures or []):
+        if not isinstance(cf, dict):
+            errs.append(f"candidate_failures[{i}] not dict")
+            continue
+        t = cf.get("type", "")
+        if t not in config.LOCAL_FAILURE_TYPES:
+            errs.append(f"candidate_failures[{i}].type={t!r} not in enum")
+        for j, sid in enumerate(cf.get("step_ids") or []):
+            if not _is_int_in(sid, segment_step_ids):
+                errs.append(f"candidate_failures[{i}].step_ids[{j}]={sid!r} out of segment")
+
+    for i, vf in enumerate(ls.verifier_findings or []):
+        if not isinstance(vf, dict):
+            errs.append(f"verifier_findings[{i}] not dict")
+            continue
+        r = vf.get("result", "")
+        if r not in config.VERIFIER_RESULT_SET:
+            errs.append(f"verifier_findings[{i}].result={r!r} not in enum")
+        for j, sid in enumerate(vf.get("step_ids") or []):
+            if not _is_int_in(sid, segment_step_ids):
+                errs.append(f"verifier_findings[{i}].step_ids[{j}]={sid!r} out of segment")
+
+    return (len(errs) == 0), errs
+
+
+def coerce_local_summary(ls: LocalSummary, segment_step_ids: Set[int]) -> LocalSummary:
+    """温和修正:剔除越界 step_ids、剔除越界 type/result。不改变其他字段。"""
+    def _filter_ids(ids):
+        out = []
+        for x in (ids or []):
+            try:
+                xi = int(x)
+                if xi in segment_step_ids:
+                    out.append(xi)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    new_events = []
+    for ev in (ls.key_events or []):
+        if isinstance(ev, dict):
+            ev = dict(ev)
+            ev["step_ids"] = _filter_ids(ev.get("step_ids"))
+            new_events.append(ev)
+    ls.key_events = new_events
+
+    new_cf = []
+    for cf in (ls.candidate_failures or []):
+        if not isinstance(cf, dict):
+            continue
+        cf = dict(cf)
+        if cf.get("type") not in config.LOCAL_FAILURE_TYPES:
+            cf["type"] = "none"
+        cf["step_ids"] = _filter_ids(cf.get("step_ids"))
+        new_cf.append(cf)
+    ls.candidate_failures = new_cf
+
+    new_vf = []
+    for vf in (ls.verifier_findings or []):
+        if not isinstance(vf, dict):
+            continue
+        vf = dict(vf)
+        if vf.get("result") not in config.VERIFIER_RESULT_SET:
+            vf["result"] = "UNKNOWN"
+        vf["step_ids"] = _filter_ids(vf.get("step_ids"))
+        new_vf.append(vf)
+    ls.verifier_findings = new_vf
+
+    return ls
+
+
+# ----------------------------------------------------------------------------
+# PhaseSummary
+# ----------------------------------------------------------------------------
+def validate_phase_summary(ps: PhaseSummary, global_step_ids: Set[int]) -> Tuple[bool, List[str]]:
+    errs: List[str] = []
+    if not isinstance(ps.phases, list) or not ps.phases:
+        errs.append("phases empty or not list")
+        return False, errs
+    for i, ph in enumerate(ps.phases):
+        if not isinstance(ph, dict):
+            errs.append(f"phases[{i}] not dict")
+            continue
+        for j, sid in enumerate(ph.get("supporting_step_ids") or []):
+            if not _is_int_in(sid, global_step_ids):
+                errs.append(f"phases[{i}].supporting_step_ids[{j}]={sid!r} out of global")
+        # sub_phases: 仅校验 step_range 两端为合法 int ∈ global(连续/覆盖由 presenter 确定性修补)
+        for k, sp in enumerate(ph.get("sub_phases") or []):
+            if isinstance(sp, dict):
+                rng = sp.get("step_range") or []
+                if not (isinstance(rng, list) and len(rng) == 2
+                        and _is_int_in(rng[0], global_step_ids)
+                        and _is_int_in(rng[1], global_step_ids)):
+                    errs.append(f"phases[{i}].sub_phases[{k}].step_range={rng!r} invalid")
+        for k, fs in enumerate(ph.get("failure_signals") or []):
+            if isinstance(fs, dict):
+                if fs.get("severity") not in {"low", "medium", "high"}:
+                    errs.append(f"phases[{i}].failure_signals[{k}].severity invalid")
+                for j, sid in enumerate(fs.get("step_ids") or []):
+                    if not _is_int_in(sid, global_step_ids):
+                        errs.append(f"phases[{i}].failure_signals[{k}].step_ids[{j}]={sid!r} out")
+    return (len(errs) == 0), errs
+
+
+def coerce_phase_summary(ps: PhaseSummary, global_step_ids: Set[int]) -> PhaseSummary:
+    def _filter(ids):
+        out = []
+        for x in (ids or []):
+            try:
+                xi = int(x)
+                if xi in global_step_ids:
+                    out.append(xi)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    new_phases = []
+    for ph in (ps.phases or []):
+        if not isinstance(ph, dict):
+            continue
+        ph = dict(ph)
+        ph["supporting_step_ids"] = _filter(ph.get("supporting_step_ids"))
+        # sub_phases: 剔除 step_range 非法的项(连续/覆盖修补留给 presenter)
+        new_sp = []
+        for sp in (ph.get("sub_phases") or []):
+            if isinstance(sp, dict):
+                rng = sp.get("step_range") or []
+                if (isinstance(rng, list) and len(rng) == 2
+                        and rng[0] in global_step_ids and rng[1] in global_step_ids):
+                    new_sp.append(dict(sp))
+        ph["sub_phases"] = new_sp
+        new_fs = []
+        for fs in (ph.get("failure_signals") or []):
+            if isinstance(fs, dict):
+                fs = dict(fs)
+                if fs.get("severity") not in {"low", "medium", "high"}:
+                    fs["severity"] = "medium"
+                fs["step_ids"] = _filter(fs.get("step_ids"))
+                new_fs.append(fs)
+        ph["failure_signals"] = new_fs
+        new_phases.append(ph)
+    ps.phases = new_phases
+    return ps
+
+
+# ----------------------------------------------------------------------------
+# RootCauseAnnotation
+# ----------------------------------------------------------------------------
+def validate_root_cause(
+    ann: RootCauseAnnotation,
+    global_step_ids: Set[int],
+    valid_agents_raw: Set[str],
+    all_steps: Optional[List[Step]] = None,
+) -> Tuple[bool, List[str]]:
+    errs: List[str] = []
+
+    # 1. step
+    if not _step_field_ok(ann.step, global_step_ids):
+        errs.append(
+            f"scored root step={ann.step!r} must be a recorded trajectory step"
+        )
+
+    # 2. agent
+    if ann.agent not in valid_agents_raw:
+        errs.append(
+            f"scored root agent={ann.agent!r} must be a trajectory recorded role"
+        )
+
+    # 3. evidence_step_ids
+    if not isinstance(ann.evidence_step_ids, list):
+        errs.append("evidence_step_ids not list")
+    else:
+        for i, sid in enumerate(ann.evidence_step_ids):
+            if not _is_int_in(sid, global_step_ids):
+                errs.append(f"evidence_step_ids[{i}]={sid!r} not in global step_ids")
+        if not ann.abstain and not ann.evidence_step_ids:
+            errs.append("evidence_step_ids empty while abstain=false")
+
+    # 4. primary_category(单选,必填) + contributing_factors(可选多选)
+    if not ann.primary_category:
+        errs.append("primary_category empty (must pick exactly 1)")
+    elif ann.primary_category not in config.CATEGORY_CODES:
+        errs.append(f"primary_category={ann.primary_category!r} not in enum")
+    if not isinstance(ann.contributing_factors, list):
+        errs.append("contributing_factors not list")
+    else:
+        seen = set()
+        for i, c in enumerate(ann.contributing_factors):
+            if c not in config.CATEGORY_CODES:
+                errs.append(f"contributing_factors[{i}]={c!r} not in enum")
+            if c == ann.primary_category:
+                errs.append(f"contributing_factors[{i}]={c!r} duplicates primary_category")
+            if c in seen:
+                errs.append(f"contributing_factors[{i}]={c!r} duplicated")
+            seen.add(c)
+
+    # 5. failure_chain
+    da = ann.detailed_analysis if isinstance(ann.detailed_analysis, dict) else {}
+    chain = da.get("failure_chain") if isinstance(da.get("failure_chain"), list) else []
+    has_root = any(isinstance(x, dict) and x.get("role") == "root_cause" for x in chain)
+    has_manifestation = any(isinstance(x, dict) and x.get("role") == "manifestation" for x in chain)
+    has_term = any(isinstance(x, dict) and x.get("role") == "terminal" for x in chain)
+    if not has_root:
+        errs.append("failure_chain missing role=root_cause node")
+    if not has_manifestation:
+        errs.append("failure_chain missing role=manifestation node")
+    if not has_term:
+        errs.append("failure_chain missing role=terminal node")
+    for i, node in enumerate(chain):
+        if not isinstance(node, dict):
+            errs.append(f"failure_chain[{i}] not dict")
+            continue
+        if node.get("role") not in config.ROLE_SET:
+            errs.append(f"failure_chain[{i}].role={node.get('role')!r} not in enum")
+        allow_pseudo = node.get("role") == "terminal"
+        if not _step_field_ok(
+            node.get("step", ""),
+            global_step_ids,
+            allow_pseudo=allow_pseudo,
+        ):
+            errs.append(f"failure_chain[{i}].step={node.get('step')!r} invalid")
+
+    # 6. confidence
+    conf = da.get("confidence", "")
+    if conf not in config.CONFIDENCE_SET:
+        errs.append(f"confidence={conf!r} not in enum")
+    elif ann.abstain and conf != "low":
+        errs.append(f"abstain=true requires confidence=low (got {conf})")
+
+    # 7. 双层定位事件:root_cause_event 用于顶层 mistake_* 与统计,
+    #    failure_manifestation_event 仅用于日志显露点审阅参考。
+    root_event = _event_dict(da, "root_cause_event")
+    manifestation_event = _event_dict(da, "failure_manifestation_event")
+    errs.extend(_validate_event(root_event, "root_cause_event", global_step_ids, valid_agents_raw))
+    errs.extend(_validate_event(manifestation_event, "failure_manifestation_event", global_step_ids, valid_agents_raw))
+    if root_event:
+        if str(root_event.get("step", "")).strip() != str(ann.step).strip():
+            errs.append("root_cause_event.step must mirror the scored root step")
+        if root_event.get("agent") != ann.agent:
+            errs.append("root_cause_event.agent must mirror the scored root role")
+
+    if manifestation_event:
+        mstep = str(manifestation_event.get("step", "")).strip()
+        in_chain = any(
+            isinstance(node, dict)
+            and str(node.get("step", "")).strip() == mstep
+            and node.get("role") in _MANIFEST_CHAIN_ROLES
+            for node in chain
+        )
+        if not in_chain:
+            errs.append(
+                "failure_manifestation_event.step must appear in failure_chain "
+                "with role manifestation/exposure/terminal"
+            )
+
+    # 8. planner 形态归因须有原文佐证(防反向过度归因到 DiagnostAgent / 委派态)。
+    #    需要 all_steps 才能核对委派步原文;调用方未传则跳过(不破坏既有行为)。
+    if all_steps is not None:
+        errs.extend(_validate_planner_attribution(ann, da, all_steps))
+        errs.extend(_validate_manifestation_event(manifestation_event, all_steps))
+
+    return (len(errs) == 0), errs
+
+
+def _validate_manifestation_event(event: Dict[str, Any], all_steps: List[Step]) -> List[str]:
+    errs: List[str] = []
+    if not event:
+        return errs
+    step_by_id = {s.step_id: s for s in all_steps}
+    sid = _to_int(event.get("step"))
+    st = step_by_id.get(sid) if sid is not None else None
+    if st is None:
+        return errs
+
+    if st.agent_normalized == "planner":
+        quote = str(event.get("evidence_quote") or event.get("quote") or "").strip()
+        if not _quote_grounded(quote, st.content_full):
+            errs.append(
+                "planner as failure_manifestation_event requires evidence_quote grounded in that planner step; "
+                "generic planning omissions are not enough"
+            )
+
+    if event.get("primary_category") == "D2_unrecovered_tool_failure" and _looks_like_recovered_tool_noise(st, all_steps):
+        errs.append(
+            "failure_manifestation_event looks like a recovered tool/runtime failure; "
+            "if later logs recovered, choose the later concrete wrong action/judgment"
+        )
+    return errs
+
+
+def _validate_planner_attribution(
+    ann: RootCauseAnnotation, da: Dict[str, Any], all_steps: List[Step]
+) -> List[str]:
+    """把"根因归给 planner 任一形态"变成可机器校验的事实:必须指向真正的 planner 步,
+    且(若是忠实实现回溯)能在该委派步原文里逐字找到被照搬的缺陷句。无标注下也成立——
+    校验对象是轨迹自身文本。"""
+    errs: List[str] = []
+    step_by_id = {s.step_id: s for s in all_steps}
+    planner_raw = {s.agent_name_raw for s in all_steps if s.agent_normalized == "planner"}
+
+    dt = da.get("delegation_trace") if isinstance(da.get("delegation_trace"), dict) else {}
+    faithful = bool(dt.get("is_faithful_implementation"))
+    root_sid = _to_int(ann.step)
+    root_step = step_by_id.get(root_sid) if root_sid is not None else None
+    is_planner_attr = ann.agent in planner_raw
+
+    # 7a. 忠实实现(trace-back)子情形:必须引用委派原文里的缺陷句,且字段一致。
+    if faithful:
+        pby = _to_int(dt.get("prescribed_by_step"))
+        deleg = step_by_id.get(pby) if pby is not None else None
+        if deleg is None or deleg.action_type != "delegate":
+            errs.append(
+                f"delegation_trace.prescribed_by_step={dt.get('prescribed_by_step')!r} is not a valid delegate step"
+            )
+        else:
+            if not _quote_grounded(str(dt.get("quote") or ""), deleg.content_full):
+                errs.append(
+                    f"delegation_trace.quote was not found in the original text of delegate step {pby} "
+                    f"(faithful-implementation attribution requires a verbatim quotation of the copied defective sentence; otherwise attribution must not trace back to the planner)"
+                )
+            if root_sid != pby:
+                errs.append(
+                    f"When is_faithful_implementation=true, step must equal prescribed_by_step({pby}); actual={ann.step!r}"
+                )
+            if " (-> " not in ann.agent:
+                errs.append(f"Faithful-implementation attribution requires a delegation-state agent name (containing ' (-> '); actual={ann.agent!r}")
+            if ann.primary_category not in _FAITHFUL_PRIMARY_OK:
+                errs.append(
+                    f"Faithful-implementation attribution requires primary_category ∈ {{C1_flawed_plan, A2_ignored_constraint}}; "
+                    f"actual={ann.primary_category!r} (logical plan error→C1; plan ignoring an explicit task method/constraint→A2)"
+                )
+
+    # 7b. 任何 planner 形态归因:根因须指向真正的 planner 步,且不得配执行/验证/非agent类主因。
+    if is_planner_attr:
+        if root_step is None or root_step.agent_normalized != "planner":
+            errs.append(
+                f"agent={ann.agent!r} is a planner form, but step={ann.step!r} is not a planner step "
+                f"(do not assign downstream execution/verification errors to the planner by default)"
+            )
+        if ann.primary_category in _PLANNER_PRIMARY_FORBIDDEN:
+            errs.append(
+                f"Planner attribution must not use an execution/verification/non-agent primary category (D*/E*/X*); actual={ann.primary_category!r} "
+                f"(missed detection by a verifier belongs in E1_verification_gap as a contributing factor, not to the planner)"
+            )
+
+    return errs
+
+
+def coerce_root_cause(
+    ann: RootCauseAnnotation,
+    global_step_ids: Set[int],
+    valid_agents_raw: Set[str],
+    all_steps: Optional[List[Step]] = None,
+) -> RootCauseAnnotation:
+    """温和修正越界。无法修正的字段保留原状,由上层用 abstain 兜底。"""
+    if isinstance(ann.evidence_step_ids, list):
+        ann.evidence_step_ids = [
+            int(x) for x in ann.evidence_step_ids
+            if isinstance(x, int) or (isinstance(x, str) and x.isdigit() and int(x) in global_step_ids)
+        ]
+        ann.evidence_step_ids = [x for x in ann.evidence_step_ids if x in global_step_ids]
+
+    # primary_category 越界则清空(由上层用 abstain 兜底);contributing 剔除越界/重复/与主因重复
+    if ann.primary_category and ann.primary_category not in config.CATEGORY_CODES:
+        ann.primary_category = ""
+    if isinstance(ann.contributing_factors, list):
+        seen = set()
+        ann.contributing_factors = [
+            c for c in ann.contributing_factors
+            if c in config.CATEGORY_CODES
+            and c != ann.primary_category
+            and not (c in seen or seen.add(c))
+        ]
+    else:
+        ann.contributing_factors = []
+
+    root_sid = _to_int(ann.step)
+    step_by_id = {step.step_id: step for step in (all_steps or [])}
+    if root_sid not in global_step_ids:
+        ann.agent = ""
+        ann.step = ""
+    else:
+        ann.step = str(root_sid)
+        recorded_root = step_by_id.get(root_sid)
+        if ann.agent not in valid_agents_raw and recorded_root is not None:
+            ann.agent = recorded_root.agent_name_raw
+        elif ann.agent not in valid_agents_raw:
+            ann.agent = ""
+
+    if not isinstance(ann.detailed_analysis, dict):
+        ann.detailed_analysis = {}
+        ann.needs_human_review = True
+
+    if isinstance(ann.detailed_analysis, dict):
+        conf = ann.detailed_analysis.get("confidence", "")
+        if conf not in config.CONFIDENCE_SET:
+            ann.detailed_analysis["confidence"] = "low"
+        if ann.abstain:
+            ann.detailed_analysis["confidence"] = "low"
+
+        root_event = ann.detailed_analysis.get("root_cause_event")
+        if not isinstance(root_event, dict):
+            root_event = {
+                "agent": ann.agent,
+                "step": ann.step,
+                "reason": ann.reason,
+                "evidence_step_ids": ann.evidence_step_ids,
+                "primary_category": ann.primary_category,
+                "contributing_factors": ann.contributing_factors,
+            }
+            ann.detailed_analysis["root_cause_event"] = root_event
+            ann.needs_human_review = True
+        else:
+            root_event["agent"] = ann.agent
+            root_event["step"] = ann.step
+
+        chain = ann.detailed_analysis.get("failure_chain")
+        if isinstance(chain, list) and root_sid in global_step_ids:
+            for node in chain:
+                if (
+                    isinstance(node, dict)
+                    and node.get("role") == "root_cause"
+                    and _to_int(node.get("step")) == root_sid
+                ):
+                    node["agent"] = ann.agent
+                    node["step"] = ann.step
+        manifestation_event = ann.detailed_analysis.get("failure_manifestation_event")
+        if not isinstance(manifestation_event, dict):
+            ann.detailed_analysis["failure_manifestation_event"] = dict(ann.detailed_analysis["root_cause_event"])
+            ann.needs_human_review = True
+
+        # 忠实实现回溯若无法被委派原文支撑,撤销该声明并交人工(不静默改 agent/step;
+        # 避免 presenter 展示一条引不出原文的"委派溯源")。
+        dt = ann.detailed_analysis.get("delegation_trace")
+        if all_steps is not None and isinstance(dt, dict) and dt.get("is_faithful_implementation"):
+            step_by_id = {s.step_id: s for s in all_steps}
+            deleg = step_by_id.get(_to_int(dt.get("prescribed_by_step")))
+            if (deleg is None or deleg.action_type != "delegate"
+                    or not _quote_grounded(str(dt.get("quote") or ""), deleg.content_full)):
+                dt["is_faithful_implementation"] = False
+                ann.needs_human_review = True
+
+    return ann

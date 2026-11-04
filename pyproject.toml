@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rcta-core"
+version = "0.1.0"
+description = "Root-Cause Trajectory Attribution for failed agent execution histories"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = ["openai>=1.0.0"]
+
+[project.scripts]
+rcta-analyze = "rcta.run:main"
+
+[tool.setuptools.packages.find]
+include = ["rcta", "rcta.*"]
+
+[tool.setuptools.package-data]
+rcta = ["prompts/*.md"]
