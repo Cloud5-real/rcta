@@ -7,9 +7,9 @@ from typing import Dict, Any, List, Optional, Set
 
 from .. import config
 from ..core.schema import Step, Segment, LocalSummary
-from ..core.llm_client import DeepSeekClient
+from ..core.llm_client import LLMClient
 
-LOG = logging.getLogger("MAS_trajectory_analysis.local")
+LOG = logging.getLogger("rcta.local")
 
 
 SYS_PROMPT = None  # 延迟加载
@@ -72,7 +72,7 @@ def _build_user_message(
 
 
 def summarize_segment(
-    client: DeepSeekClient,
+    client: LLMClient,
     seg: Segment,
     task_brief: str,
     previous_errors: Optional[List[str]] = None,

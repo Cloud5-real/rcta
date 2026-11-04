@@ -1,5 +1,4 @@
-# Modified 2026-11-04: standalone paths; no directory creation at import.
-"""v2 全局配置。所有常量集中此处,便于 CLI 覆盖或后续 v3 扩展。"""
+"""RCTA 全局配置。所有常量集中此处;运行路径与模型接口可用环境变量覆盖。"""
 from __future__ import annotations
 
 import os
@@ -8,25 +7,15 @@ from pathlib import Path
 # ----------------------------------------------------------------------------
 # Paths
 # ----------------------------------------------------------------------------
-# Standalone distribution: runtime paths are relative to the current working directory.
+# Runtime paths are relative to the current working directory.
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
-WHO_WHEN_DIR = Path(os.environ.get("RCTA_INPUT_DIR", "inputs"))
+INPUT_DIR = Path(os.environ.get("RCTA_INPUT_DIR", "inputs"))
 OUT_ROOT = Path(os.environ.get("RCTA_OUTPUT_DIR", "outputs"))
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
 LOGS_DIR = Path(os.environ.get("RCTA_LOG_DIR", "logs"))
 
-# 5 bench 通用,但目前只有 swe_bench_pro 和 terminal_bench_2 落地
-SUPPORTED_BENCHMARKS = [
-    "swe_bench_pro",
-    "terminal_bench_2",
-    "travelplanner",
-    "vitabench",
-    "webarena_verified",
-]
-
 # ----------------------------------------------------------------------------
-# LLM API (deepseek-v4-pro)
+# LLM API (any OpenAI-compatible service; default deepseek-v4-pro)
 # ----------------------------------------------------------------------------
 # provider 中性命名 LLM_* 优先,保留 DEEPSEEK_* 作向后兼容别名。适配任意 OpenAI 兼容服务。
 LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or ""
@@ -52,17 +41,16 @@ LLM_MAX_TOKENS_ROOT = int(os.environ.get("LLM_MAX_TOKENS_ROOT", 8000))   # root:
 #   - Stage 2 局部摘要 = 抽取型简单任务,但调用量最大(N 段=N 次)→ **关 thinking** 省时省 token
 #     (thinking 关时 temperature 重新生效,抽取更稳定)。
 #   - Stage 3 阶段聚合 = 结构化归并 → 开 thinking,effort=high。
-#   - Stage 4 根因判定 = 唯一需要深度因果推理(去偏逻辑全在此)→ 开 thinking,effort=max。
+#   - Stage 4 根因判定 = 唯一需要深度因果推理(去偏逻辑全在此)→ 开 thinking,effort=high。
 # llm_client.chat() 按 per-call `thinking`/`reasoning_effort` 决定(覆盖下面的全局回退)。
 LLM_THINKING_ENABLED = True              # 全局回退默认(未显式指定 thinking 的调用沿用它)
-LLM_REASONING_EFFORT_DEFAULT = "high"    # 全局回退默认 effort(向后兼容)
 
 LLM_THINKING_LOCAL = False              # Stage 2 局部摘要:关 thinking(抽取型简单任务,占 84% 调用/成本,
 LLM_REASONING_EFFORT_LOCAL = None       #   关后单文件耗时≈1/4;thinking 关 → effort 不读、temperature=0.1 重新生效)
 LLM_THINKING_PHASE = True                # Stage 3 阶段聚合:开
 LLM_REASONING_EFFORT_PHASE = "high"
 LLM_THINKING_ROOT = True                 # Stage 4 根因判定:开
-LLM_REASONING_EFFORT_ROOT = "high"       
+LLM_REASONING_EFFORT_ROOT = "high"
 LLM_SEND_THINKING_CONFIG = os.environ.get("LLM_SEND_THINKING_CONFIG", "true").lower() not in {
     "0", "false", "no", "off"
 }
@@ -84,16 +72,12 @@ SEG_OVERLAP_STEPS = 5
 # 一律向 prompt 发 content_full / 完整 question / 完整 verifier。只留一个极高安全帽防失控大 step。
 STEP_FULL_MAX_CHARS = 200_000   # 单步>20万字符才截(纯防御,正常 step 远低于此,几乎不触发)
 
-# 以下为旧"裁内容"常量,Round 6 起**不再用于裁 prompt 内容**;仅 STEP_HASH_* 仍用于指纹。
+# 以下常量不用于裁 prompt 内容;STEP_HASH_* 用于指纹。
 STEP_HASH_HEAD_CHARS = 200
 STEP_HASH_TAIL_CHARS = 200
-# 兼容保留(step_enricher 仍据此算 content_head/tail 备查,但不再喂 prompt):
+# step_enricher 据此算 content_head/tail 备查,不再喂 prompt:
 STEP_HEAD_CHARS = 500
 STEP_TAIL_CHARS = 500
-# 兼容保留(已不再用于裁 task 文本):
-TASK_QUESTION_CHARS = 2000
-TASK_VERIFIER_CHARS = 1500
-ROOT_VERIFIER_CHARS = 10000
 
 # ----------------------------------------------------------------------------
 # Taxonomy enums (validator/global/presenter use)

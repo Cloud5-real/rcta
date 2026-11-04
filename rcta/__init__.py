@@ -1,1 +1,3 @@
-"""v2 LLM 失败轨迹根因分析 pipeline。"""
+"""RCTA: Root-Cause Trajectory Attribution for failed multi-agent trajectories."""
+
+__version__ = "0.2.0"

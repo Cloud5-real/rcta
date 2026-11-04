@@ -1,4 +1,3 @@
-# Modified 2026-11-04: standalone CLI module name and path help text.
 """Standalone RCTA CLI: python -m rcta --input-dir inputs --output-dir outputs."""
 from __future__ import annotations
 
@@ -27,7 +26,7 @@ if __package__ in (None, ""):
 from . import config
 from .preprocess.loader import list_input_files, load_trajectory, build_task_brief
 from .preprocess.segmenter import segment_trajectory, split_in_half
-from .core.llm_client import DeepSeekClient
+from .core.llm_client import LLMClient
 from .analyze.local_summarizer import summarize_segment
 from .analyze.global_reducer import (
     aggregate_phases, diagnose_root_cause, build_verifier_signal_summary,
@@ -47,7 +46,7 @@ from .output.run_snapshot import freeze_run_snapshot
 from .core.schema import LocalSummary, PhaseSummary, RootCauseAnnotation, Segment
 
 
-LOG = logging.getLogger("MAS_trajectory_analysis")
+LOG = logging.getLogger("rcta")
 
 _shutdown_event = threading.Event()
 
@@ -139,13 +138,21 @@ def write_error_marker(
     _atomic_write_json(error_marker_path(out_root, bench, src_path.name), marker)
 
 
+def clear_error_marker(out_root: Path, bench: str, filename: str) -> None:
+    """样本重跑成功后删除旧的失败标记,避免 --skip-error-markers 误跳过。"""
+    try:
+        error_marker_path(out_root, bench, filename).unlink()
+    except FileNotFoundError:
+        pass
+
+
 # ----------------------------------------------------------------------------
 # Pipeline
 # ----------------------------------------------------------------------------
 def process_one(
     src_path: Path,
     bench: str,
-    client: DeepSeekClient,
+    client: LLMClient,
     out_root: Path,
     overwrite: bool,
     dry_run: bool,
@@ -316,7 +323,7 @@ def _install_signal_handler() -> None:
 
 
 def _run_with_alarm(fn, timeout_seconds: int) -> str:
-    if timeout_seconds <= 0:
+    if timeout_seconds <= 0 or not hasattr(signal, "SIGALRM"):
         return fn()
 
     def _alarm_handler(signum, frame):
@@ -336,12 +343,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
     label = args.benchmark or (Path(args.input_dir).name if args.input_dir else "flat")
-    log_file = config.LOGS_DIR / f"v2_{label}_{dt.datetime.now():%Y%m%d_%H%M%S}.log"
+    log_file = config.LOGS_DIR / f"rcta_{label}_{dt.datetime.now():%Y%m%d_%H%M%S}.log"
     setup_logging(args.verbose, log_file=log_file)
 
     _install_signal_handler()
 
-    input_dir = Path(args.input_dir) if args.input_dir else config.WHO_WHEN_DIR
+    input_dir = Path(args.input_dir) if args.input_dir else config.INPUT_DIR
     out_root = Path(args.output_dir or args.out_root or config.OUT_ROOT)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -363,32 +370,41 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     run_model = args.model or config.LLM_MODEL
     run_base_url = args.base_url or config.LLM_BASE_URL
-    try:
-        freeze_run_snapshot(
-            out_root=out_root,
-            benchmark=bench_label,
-            model=run_model,
-            base_url=run_base_url,
-            input_dir=input_dir,
-            input_files=files,
-        )
-    except (OSError, ValueError, RuntimeError) as exc:
-        LOG.error("cannot freeze run snapshot: %s", exc)
-        return 2
+
+    # 先建客户端再冻结快照:缺 key 等配置错误不应留下一个空跑的 run_snapshot。
+    client: Optional[LLMClient] = None
+    if not args.dry_run:
+        try:
+            client = LLMClient(model=run_model, base_url=run_base_url)
+        except RuntimeError as exc:
+            LOG.error("%s", exc)
+            return 2
+        LOG.info("LLM endpoint: model=%s base_url=%s", run_model, run_base_url)
+
+    # dry-run 不产出结果,也不冻结快照,避免锁死后续正式运行的输出目录。
+    if not args.dry_run:
+        try:
+            freeze_run_snapshot(
+                out_root=out_root,
+                benchmark=bench_label,
+                model=run_model,
+                base_url=run_base_url,
+                input_dir=input_dir,
+                input_files=files,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            LOG.error("cannot freeze run snapshot: %s", exc)
+            return 2
+
+    if args.sample_timeout > 0:
+        if not hasattr(signal, "SIGALRM"):
+            LOG.warning("--sample-timeout needs SIGALRM (unavailable on Windows); ignored")
+        elif args.workers > 1:
+            LOG.warning("--sample-timeout only applies when --workers 1; ignored")
 
     LOG.info("input_dir=%s benchmark=%s n_files=%d workers=%d dry_run=%s overwrite=%s debug_sidecar=%s out=%s",
              input_dir, args.benchmark, len(files), args.workers, args.dry_run,
              args.overwrite, args.debug_sidecar, out_root)
-
-    client = (
-        DeepSeekClient(
-            model=run_model,
-            base_url=run_base_url,
-        )
-        if not args.dry_run else None  # type: ignore[assignment]
-    )
-    if client is not None:
-        LOG.info("LLM endpoint: model=%s base_url=%s", run_model, run_base_url)
 
     def _run(p: Path) -> str:
         return process_one(p, bench_label, client, out_root, args.overwrite,
@@ -398,42 +414,52 @@ def main(argv: Optional[List[str]] = None) -> int:
     total = len(files)
     done = 0
     blabel = bench_label or "flat"
+
+    def _record(p: Path, status: str) -> None:
+        nonlocal done
+        if status.startswith("ok"):
+            clear_error_marker(out_root, bench_label, p.name)
+        stats[status] = stats.get(status, 0) + 1
+        done += 1
+        LOG.info("[%s %d/%d] %s | %s", blabel, done, total, status, p.name)
+
+    # 有失败标记的样本在提交前就跳过(并发模式下若提交后再判断,模型调用已经发生)。
+    if args.skip_error_markers:
+        pending = []
+        for p in files:
+            if error_marker_path(out_root, bench_label, p.name).exists():
+                _record(p, "skipped_error_marker")
+            else:
+                pending.append(p)
+    else:
+        pending = list(files)
+
     # 进度行:[bench done/total status | filename]。done/total 让运行的 pane 直接看到本 bench 跑了多少。
     # (两个循环体都在主线程跑 —— workers>1 时 as_completed 也在主线程 yield —— 故 done 计数无需加锁。)
     if args.workers <= 1:
-        for p in files:
+        for p in pending:
             try:
-                if args.skip_error_markers and error_marker_path(out_root, bench_label, p.name).exists():
-                    status = "skipped_error_marker"
-                else:
-                    status = _run_with_alarm(lambda p=p: _run(p), args.sample_timeout)
+                status = _run_with_alarm(lambda p=p: _run(p), args.sample_timeout)
             except Exception as e:
                 LOG.exception("file %s failed: %s", p.name, e)
                 status = f"error:{type(e).__name__}"
                 write_error_marker(out_root, bench_label, p, status, e)
-            stats[status] = stats.get(status, 0) + 1
-            done += 1
-            LOG.info("[%s %d/%d] %s | %s", blabel, done, total, status, p.name)
+            _record(p, status)
             if _shutdown_event.is_set():
                 LOG.warning("shutdown requested, stopping after current file")
                 break
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(_run, p): p for p in files}
+            futs = {ex.submit(_run, p): p for p in pending}
             for fu in as_completed(futs):
                 p = futs[fu]
                 try:
-                    if args.skip_error_markers and error_marker_path(out_root, bench_label, p.name).exists():
-                        status = "skipped_error_marker"
-                    else:
-                        status = fu.result()
+                    status = fu.result()
                 except Exception as e:
                     LOG.exception("file %s failed: %s", p.name, e)
                     status = f"error:{type(e).__name__}"
                     write_error_marker(out_root, bench_label, p, status, e)
-                stats[status] = stats.get(status, 0) + 1
-                done += 1
-                LOG.info("[%s %d/%d] %s | %s", blabel, done, total, status, p.name)
+                _record(p, status)
                 if _shutdown_event.is_set():
                     break
 

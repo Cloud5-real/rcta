@@ -1,6 +1,6 @@
-"""DeepSeek (OpenAI-compatible) client。
+"""OpenAI 兼容接口客户端(默认 DeepSeek thinking 参数,可用 LLM_SEND_THINKING_CONFIG 关闭)。
 
-从 v1 `run_llm_annotate.py` 提炼:
+功能:
 - 重试 / 退避(network error)
 - finish_reason=length 自动加 max_tokens 重试一次
 - think / markdown 围栏剥离
@@ -22,7 +22,7 @@ except ImportError:                                                       # prag
 
 from .. import config
 
-LOG = logging.getLogger("MAS_trajectory_analysis.llm")
+LOG = logging.getLogger("rcta.llm")
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
@@ -34,10 +34,14 @@ _VALID_ESCAPE_NEXT = set('"\\/bfnrtu')
 # ----------------------------------------------------------------------------
 def _is_token_limit_error(exc: Exception) -> bool:
     msg = str(exc).lower()
+    # 不能用裸 "exceed":会把 "Rate limit exceeded"(429)误判成超长而跳过重试。
+    if "rate limit" in msg or "ratelimit" in msg or "429" in msg:
+        return False
     keywords = [
         "context_length_exceeded", "maximum context length", "too many tokens",
         "token limit", "context window", "request too large", "payload too large",
-        "content_length_limit", "reduce the length", "input is too long", "exceed",
+        "content_length_limit", "reduce the length", "input is too long",
+        "exceeds the context", "exceeds the maximum", "context length exceeded",
     ]
     return any(kw in msg for kw in keywords)
 
@@ -141,7 +145,7 @@ def parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
 # ----------------------------------------------------------------------------
 # Client
 # ----------------------------------------------------------------------------
-class DeepSeekClient:
+class LLMClient:
     def __init__(
         self,
         api_key: str = config.LLM_API_KEY,
@@ -280,3 +284,7 @@ class DeepSeekClient:
             )
         parsed = parse_json_response(raw)
         return parsed, raw, finish
+
+
+# 旧名兼容:早期代码以 DeepSeekClient 引用该类。
+DeepSeekClient = LLMClient

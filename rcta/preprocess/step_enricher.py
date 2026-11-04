@@ -19,6 +19,7 @@ from ..core.schema import Step
 # ----------------------------------------------------------------------------
 # Agent normalization
 # ----------------------------------------------------------------------------
+# 接入新的多 Agent 系统时,只需修改本节的角色名集合(见 docs/adapting.md)。
 # Magentic-One(Who&When Hand-Crafted)新增:Orchestrator=planner;WebSurfer/FileSurfer/Assistant/Coder=executor。
 PLANNERS = {
     "DiagnostAgent",
@@ -41,6 +42,9 @@ VERIFIERS = {"JudgeAgent", "Verification_Expert", "verifier_agent"}
 # Computer_terminal(AutoGen)/ComputerTerminal(Magentic)均视为 terminal。
 TERMINAL_NAMES = {"Computer_terminal", "ComputerTerminal"}
 HUMAN_NAMES = {"human"}
+# 出现任一名称即视为 Magentic-One 风格轨迹(Who&When Hand-Crafted),
+# global_reducer 会对其额外启用基于正文关键词的候选召回规则。
+MAGENTIC_ONE_NAMES = {"Orchestrator", "WebSurfer", "FileSurfer", "Assistant", "Coder", "ComputerTerminal"}
 
 
 def normalize_agent_name(name: str) -> str:

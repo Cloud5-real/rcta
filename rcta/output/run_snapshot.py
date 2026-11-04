@@ -66,8 +66,28 @@ def _config_snapshot() -> Dict[str, Any]:
     return {name: getattr(config, name, None) for name in names}
 
 
+# Fields that may legitimately differ between a run and a later resume/rerun.
+# The input file list is checked separately: a rerun may cover a subset.
+_NON_IDENTITY_KEYS = frozenset({
+    "created_at_utc", "input_count", "input_file_list_sha256", "input_files",
+})
+
+
 def _identity(manifest: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: value for key, value in manifest.items() if key != "created_at_utc"}
+    return {key: value for key, value in manifest.items() if key not in _NON_IDENTITY_KEYS}
+
+
+def _mismatched_keys(existing: Dict[str, Any], candidate: Dict[str, Any]) -> list:
+    old, new = _identity(existing), _identity(candidate)
+    return sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+
+
+def _inputs_compatible(existing: Dict[str, Any], file_names: list, file_list_sha: str) -> bool:
+    recorded = existing.get("input_files")
+    if isinstance(recorded, list):
+        return set(file_names) <= set(recorded)
+    # Manifests written before input_files was recorded only carry the hash.
+    return existing.get("input_file_list_sha256") == file_list_sha
 
 
 def freeze_run_snapshot(
@@ -111,6 +131,7 @@ def freeze_run_snapshot(
         "input_dir": str(Path(input_dir).resolve()),
         "input_count": len(file_names),
         "input_file_list_sha256": _sha256(file_list_bytes),
+        "input_files": file_names,
         "prompts": prompt_entries,
         "config": _config_snapshot(),
     }
@@ -126,10 +147,15 @@ def freeze_run_snapshot(
             filename: entry["sha256"]
             for filename, entry in (existing.get("prompts") or {}).items()
         }
-        if _identity(existing) != _identity(candidate) or copied_hashes != expected_hashes:
+        problems = _mismatched_keys(existing, candidate)
+        if copied_hashes != expected_hashes:
+            problems.append("prompt snapshot files")
+        if not _inputs_compatible(existing, file_names, candidate["input_file_list_sha256"]):
+            problems.append("input files (not a subset of the recorded run)")
+        if problems:
             raise RuntimeError(
-                "run snapshot mismatch: refusing to mix outputs produced with "
-                "different prompts, inputs, model, or settings"
+                "run snapshot mismatch in " + ", ".join(problems)
+                + f"; refusing to mix outputs in {out_root}. Use a new --output-dir."
             )
         return existing
 

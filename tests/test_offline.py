@@ -7,11 +7,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from rcta import run as rcta_run
 from rcta.analyze.global_reducer import (
     _augment_with_preceding_delegates,
     _collect_candidate_step_hints,
 )
+from rcta.core.llm_client import _is_token_limit_error
 from rcta.core.schema import LocalSummary, PhaseSummary
+from rcta.output.run_snapshot import freeze_run_snapshot
 from rcta.preprocess.loader import build_task_brief, load_trajectory
 from rcta.preprocess.segmenter import segment_trajectory
 from rcta.preprocess.step_enricher import enrich_steps
@@ -192,6 +195,64 @@ class OfflineTests(unittest.TestCase):
         hints = _collect_candidate_step_hints([local], PhaseSummary(), [])
         self.assertEqual(len(hints), 80)
         self.assertEqual([h["step_id"] for h in hints], list(range(80)))
+
+
+class RunnerTests(unittest.TestCase):
+    """CLI-level behaviour: resume markers, snapshots, error classification."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.inputs = self.root / "inputs"
+        self.inputs.mkdir()
+        for name in ("a.json", "b.json"):
+            (self.inputs / name).write_text(DEMO.read_text(encoding="utf-8"), encoding="utf-8")
+        self.out = self.root / "out"
+        patcher = patch.object(rcta_run.config, "LOGS_DIR", self.root / "logs")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.temp.cleanup)
+
+    def main(self, *extra, client=None):
+        argv = ["-i", str(self.inputs), "-o", str(self.out), *extra]
+        with patch.object(rcta_run, "LLMClient", return_value=client or ScriptedClient()):
+            return rcta_run.main(argv)
+
+    def test_rate_limit_is_not_a_token_limit(self):
+        self.assertFalse(_is_token_limit_error(Exception("Error code: 429 - Rate limit exceeded")))
+        self.assertTrue(_is_token_limit_error(Exception("This model's maximum context length is 128k")))
+
+    def test_error_marker_skipped_before_submission_with_workers(self):
+        marker = rcta_run.error_marker_path(self.out, "", "a.json")
+        marker.parent.mkdir(parents=True)
+        marker.write_text("{}", encoding="utf-8")
+        client = ScriptedClient()
+        self.assertEqual(self.main("--workers", "2", "--skip-error-markers", client=client), 0)
+        self.assertEqual(client.counts["root"], 1)
+        self.assertFalse((self.out / "a.json").exists())
+        self.assertTrue((self.out / "b.json").exists())
+
+    def test_success_clears_stale_error_marker(self):
+        marker = rcta_run.error_marker_path(self.out, "", "a.json")
+        marker.parent.mkdir(parents=True)
+        marker.write_text("{}", encoding="utf-8")
+        self.assertEqual(self.main(), 0)
+        self.assertFalse(marker.exists())
+
+    def test_dry_run_writes_no_snapshot(self):
+        self.assertEqual(self.main("--dry-run"), 0)
+        self.assertFalse((self.out / "run_snapshot").exists())
+        self.assertEqual(self.main(), 0)
+
+    def test_snapshot_allows_subset_rerun_but_not_new_inputs(self):
+        files = sorted(self.inputs.glob("*.json"))
+        kwargs = dict(out_root=self.out, benchmark="", model="m", base_url="u", input_dir=self.inputs)
+        freeze_run_snapshot(input_files=files, **kwargs)
+        freeze_run_snapshot(input_files=files[:1], **kwargs)
+        with self.assertRaisesRegex(RuntimeError, "input files"):
+            freeze_run_snapshot(input_files=files + [self.inputs / "c.json"], **kwargs)
+        with self.assertRaisesRegex(RuntimeError, "model"):
+            freeze_run_snapshot(input_files=files, **{**kwargs, "model": "other"})
 
 
 if __name__ == "__main__":

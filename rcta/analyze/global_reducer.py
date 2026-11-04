@@ -8,9 +8,10 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 
 from .. import config
 from ..core.schema import Step, Segment, LocalSummary, PhaseSummary, RootCauseAnnotation
-from ..core.llm_client import DeepSeekClient
+from ..core.llm_client import LLMClient
+from ..preprocess.step_enricher import MAGENTIC_ONE_NAMES
 
-LOG = logging.getLogger("MAS_trajectory_analysis.global")
+LOG = logging.getLogger("rcta.global")
 
 _PHASE_PROMPT: Optional[str] = None
 _ROOT_PROMPT: Optional[str] = None
@@ -53,7 +54,7 @@ def compress_step_ids(step_ids: List[int]) -> str:
 # Phase aggregation
 # ----------------------------------------------------------------------------
 def aggregate_phases(
-    client: DeepSeekClient,
+    client: LLMClient,
     locals_: List[LocalSummary],
     task_brief: str,
     global_step_ids: Set[int],
@@ -160,7 +161,7 @@ def _collect_candidate_step_ids(locals_: List[LocalSummary], phases: PhaseSummar
     return [c["step_id"] for c in _collect_candidate_step_hints(locals_, phases, [])]
 
 
-_HC_AGENT_NAMES = {"Orchestrator", "WebSurfer", "FileSurfer", "Assistant", "Coder", "ComputerTerminal"}
+_HC_AGENT_NAMES = MAGENTIC_ONE_NAMES
 _RE_HC_OBSERVABLE_ERROR = re.compile(
     r"(clicked|typed|searched|scrolled|opened|visited|navigat|"
     r"wrong|incorrect|irrelevant|advertis|ad page|no results|not found|"
@@ -457,7 +458,7 @@ def _build_delegate_linkage_hints(
 
 
 def diagnose_root_cause(
-    client: DeepSeekClient,
+    client: LLMClient,
     phases: PhaseSummary,
     locals_: List[LocalSummary],
     all_steps: List[Step],

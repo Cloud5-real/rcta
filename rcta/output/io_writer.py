@@ -1,8 +1,8 @@
-"""把原 JSON 完整拷贝后,在顶层注入 5 个 v2 字段;原子写;文件锁。
+"""把原 JSON 完整拷贝后,在顶层注入 4 个 llm_* 字段;原子写;文件锁。
 
 布局:
-- 源:   Who&When_style/<bench>/<filename>.json   ← 不动
-- 输出: Who&When_style/MAS_trajectory_analysis/<bench>/<filename>.json   ← 拷贝 + 注入
+- 源:   <input-dir>[/<benchmark>]/<filename>.json    ← 不动
+- 输出: <output-dir>[/<benchmark>]/<filename>.json   ← 拷贝 + 注入
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from .. import config
 
-LOG = logging.getLogger("MAS_trajectory_analysis.io")
+LOG = logging.getLogger("rcta.io")
 
 _FILE_LOCKS: Dict[str, threading.Lock] = {}
 _FILE_LOCKS_GUARD = threading.Lock()
@@ -74,7 +74,7 @@ def inject_v2_fields(
     """深拷贝原 JSON,在顶层注入/覆盖 4 个字段(其余保持不变)。
 
     顶层 llm_mistake_agent/step/reason 精确镜像 root_cause_event,
-    用于对齐原始 Who&When 的 mistake_* 三槽;
+    用于对齐 Who&When 格式标注的 mistake_* 三槽;
     类别(primary_category / contributing_factors)只存在于
     llm_analysis_summary.root_cause,不再在顶层重复。
     """

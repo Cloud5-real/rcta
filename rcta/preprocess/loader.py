@@ -1,6 +1,6 @@
-"""轨迹文件读取 + bench 文件列表枚举。
+"""轨迹文件读取 + 输入文件列表枚举。
 
-输入是 `Who&When_style/<bench>/*.json` 顶层文件,history 字段是 step 数组。
+每个输入文件是一条轨迹 JSON,`history` 字段是 step 数组(格式见 docs/data_format.md)。
 """
 from __future__ import annotations
 
@@ -8,14 +8,8 @@ import json
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
-from .. import config
 from ..core.schema import Step
 from .step_enricher import enrich_steps
-
-
-def list_bench_files(bench: str) -> List[Path]:
-    """(兼容旧调用)列出 内置 Who&When_style/<bench> 目录下的所有 *.json。"""
-    return list_input_files(config.WHO_WHEN_DIR, bench)
 
 
 def list_input_files(input_dir: Path, benchmark: Optional[str] = None) -> List[Path]:
